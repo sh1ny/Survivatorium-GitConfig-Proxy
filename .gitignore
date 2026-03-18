@@ -1,0 +1,18 @@
+# Build output
+target/
+
+# TLS certificates (never commit private keys)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Environment files
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
