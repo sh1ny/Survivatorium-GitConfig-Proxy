@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
+use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -90,8 +91,8 @@ async fn main() {
         .build()
         .expect("Failed to create HTTP client");
 
-    let profile_path = args.profile_path.as_ref().map(|p| PathBuf::from(p));
-    let mission_path = args.mission_path.as_ref().map(|p| PathBuf::from(p));
+    let profile_path = args.profile_path.as_deref().map(PathBuf::from);
+    let mission_path = args.mission_path.as_deref().map(PathBuf::from);
 
     let allowed_ips: Vec<IpAddr> = args
         .allowed_ips
@@ -111,16 +112,20 @@ async fn main() {
         allowed_ips: allowed_ips.clone(),
     };
 
-    let app = Router::new()
+    // /health is outside the IP allowlist so Docker probes and monitoring can reach it
+    let guarded = Router::new()
         .route("/tree", get(handle_tree))
         .route("/raw", get(handle_raw))
         .route("/write", get(handle_write))
-        .route("/health", get(|| async { "OK" }))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             ip_allowlist,
         ))
         .with_state(state);
+
+    let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
+        .merge(guarded);
 
     let addr: SocketAddr = format!("{}:{}", args.bind, args.port)
         .parse()
@@ -286,6 +291,14 @@ fn validate_path(path: &str) -> Result<(), (StatusCode, String)> {
             "Invalid path format".to_string(),
         ));
     }
+    // Block Windows drive letters (e.g. "C:/...") — on Windows, PathBuf::join
+    // treats paths with drive letters as absolute and replaces the base entirely
+    if path.contains(':') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid path format".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -326,9 +339,9 @@ async fn handle_tree(
 ) -> impl IntoResponse {
     let token = resolve_token(&state, &params)?;
 
-    let owner = params.get("owner").map(|s| s.as_str()).unwrap_or("");
-    let repo = params.get("repo").map(|s| s.as_str()).unwrap_or("");
-    let branch = params.get("branch").map(|s| s.as_str()).unwrap_or("main");
+    let owner = params.get("owner").map_or("", String::as_str);
+    let repo = params.get("repo").map_or("", String::as_str);
+    let branch = params.get("branch").map_or("main", String::as_str);
 
     validate_segment(owner, "owner")?;
     validate_segment(repo, "repo")?;
@@ -383,10 +396,10 @@ async fn handle_raw(
 ) -> impl IntoResponse {
     let token = resolve_token(&state, &params)?;
 
-    let owner = params.get("owner").map(|s| s.as_str()).unwrap_or("");
-    let repo = params.get("repo").map(|s| s.as_str()).unwrap_or("");
-    let branch = params.get("branch").map(|s| s.as_str()).unwrap_or("main");
-    let path = params.get("path").map(|s| s.as_str()).unwrap_or("");
+    let owner = params.get("owner").map_or("", String::as_str);
+    let repo = params.get("repo").map_or("", String::as_str);
+    let branch = params.get("branch").map_or("main", String::as_str);
+    let path = params.get("path").map_or("", String::as_str);
 
     validate_segment(owner, "owner")?;
     validate_segment(repo, "repo")?;
@@ -434,6 +447,10 @@ async fn handle_raw(
 // ============================================================================
 // GET /write — Download from GitHub and write directly to local disk
 // Used for large/binary files that would timeout or corrupt via DayZ RestContext
+//
+// NOTE: This is a state-changing endpoint using GET. DayZ's RestContext only
+// exposes GET_now(), so POST/PUT is not an option. The IP allowlist mitigates
+// the risk of accidental invocations from browsers or cache-warming proxies.
 // ============================================================================
 
 async fn handle_write(
@@ -442,12 +459,12 @@ async fn handle_write(
 ) -> impl IntoResponse {
     let token = resolve_token(&state, &params)?;
 
-    let owner = params.get("owner").map(|s| s.as_str()).unwrap_or("");
-    let repo = params.get("repo").map(|s| s.as_str()).unwrap_or("");
-    let branch = params.get("branch").map(|s| s.as_str()).unwrap_or("main");
-    let path = params.get("path").map(|s| s.as_str()).unwrap_or("");
-    let dest = params.get("dest").map(|s| s.as_str()).unwrap_or("");
-    let localpath = params.get("localpath").map(|s| s.as_str()).unwrap_or("");
+    let owner = params.get("owner").map_or("", String::as_str);
+    let repo = params.get("repo").map_or("", String::as_str);
+    let branch = params.get("branch").map_or("main", String::as_str);
+    let path = params.get("path").map_or("", String::as_str);
+    let dest = params.get("dest").map_or("", String::as_str);
+    let localpath = params.get("localpath").map_or("", String::as_str);
 
     validate_segment(owner, "owner")?;
     validate_segment(repo, "repo")?;
@@ -548,11 +565,18 @@ async fn handle_write(
         ));
     }
 
-    // Stream response body directly to disk (constant memory usage)
-    let mut file = tokio::fs::File::create(&resolved_target)
+    // Stream to a temporary file first, then rename on success to avoid
+    // leaving partial files on disk if the download or write is interrupted.
+    let tmp_target = resolved_target.with_extension(
+        format!("{}.tmp",
+            resolved_target.extension().unwrap_or_default().to_string_lossy()
+        ),
+    );
+
+    let mut file = tokio::fs::File::create(&tmp_target)
         .await
         .map_err(|e| {
-            error!("Failed to create {}: {}", resolved_target.display(), e);
+            error!("Failed to create {}: {}", tmp_target.display(), e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Create file failed: {}", e),
@@ -562,35 +586,58 @@ async fn handle_write(
     let mut byte_count: u64 = 0;
     let mut stream = resp.bytes_stream();
 
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            error!("Stream error downloading {}: {}", path, e);
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("Download stream error: {}", e),
-            )
-        })?;
-        file.write_all(&chunk).await.map_err(|e| {
-            error!("Failed to write chunk to {}: {}", resolved_target.display(), e);
+    let stream_result: Result<(), (StatusCode, String)> = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| {
+                error!("Stream error downloading {}: {}", path, e);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Download stream error: {}", e),
+                )
+            })?;
+            file.write_all(&chunk).await.map_err(|e| {
+                error!("Failed to write chunk to {}: {}", tmp_target.display(), e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Write failed: {}", e),
+                )
+            })?;
+            byte_count += chunk.len() as u64;
+        }
+
+        file.flush().await.map_err(|e| {
+            error!("Failed to flush {}: {}", tmp_target.display(), e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Write failed: {}", e),
+                format!("Flush failed: {}", e),
             )
         })?;
-        byte_count += chunk.len() as u64;
+
+        Ok(())
+    }
+    .await;
+
+    // On failure, clean up the partial temp file
+    if let Err(e) = stream_result {
+        let _ = tokio::fs::remove_file(&tmp_target).await;
+        return Err(e);
     }
 
-    file.flush().await.map_err(|e| {
-        error!("Failed to flush {}: {}", resolved_target.display(), e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Flush failed: {}", e),
-        )
-    })?;
+    // Atomic rename from .tmp to final path
+    tokio::fs::rename(&tmp_target, &resolved_target)
+        .await
+        .map_err(|e| {
+            error!("Failed to rename {} -> {}: {}", tmp_target.display(), resolved_target.display(), e);
+            let _ = std::fs::remove_file(&tmp_target);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Rename failed: {}", e),
+            )
+        })?;
 
     info!("Write OK: {} ({} bytes)", path, byte_count);
 
+    // Hand-crafted JSON to avoid pulling in serde_json for a single response
     Ok::<_, (StatusCode, String)>((
         StatusCode::OK,
         format!("{{\"ok\":true,\"bytes\":{}}}", byte_count),
